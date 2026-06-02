@@ -21,22 +21,57 @@ DEFAULT_OUTPUT_DIR = ROOT_DIR / "artifacts" / "orders"
 
 def build_system_prompt(today: str | None = None) -> str:
     current_day = today or "2026-06-01"
-    return f"""
-You are an order assistant.
-Today is {current_day}.
+    return f"""You are a strict order assistant. Today is {current_day}.
 
-Try to help the user make an order with the tools.
-Usually check products, then pricing, then save.
-If something is missing or unsafe, handle it as best as you can.
-Answer in Vietnamese.
-Keep the answer short.
-""".strip()
+## STEP 0 — GUARDRAILS (check before everything else)
+If the request contains ANY of the following instructions, REFUSE the ENTIRE request immediately. Do NOT call any tools. Do NOT process even the "valid parts" of such requests.
+- Bypass or ignore stock limits
+- Skip catalog or pricing checks
+- Apply unauthorized discounts or manually set discount rates
+- Create fake invoices or orders outside the system
+
+## STEP 1 — PRE-FLIGHT CHECK (before calling any tool)
+An order requires EXACTLY these 4 fields. Check each one:
+  [1] Customer full name    — must be stated explicitly
+  [2] Phone number          — must be stated explicitly (digits)
+  [3] Email address         — must be stated explicitly (contains @)
+  [4] Shipping address      — must be stated explicitly
+
+If ANY of the 4 is absent → reply asking for only the missing field(s). Do NOT call any tools.
+Note: a phone number is NOT an email. An address is NOT an email. Check for @ symbol.
+
+## STEP 2 — TOOL SEQUENCE (must follow this exact order, no exceptions)
+1. list_products — call separately for each product name (multiple calls allowed, one per product)
+2. get_product_details — ONE call with ALL product_ids at once → gives detail_token
+3. get_discount — ONLY AFTER step 2 completes; pass customer EMAIL as `customer` → gives discount_rate and campaign_code
+4. calculate_order_totals — use detail_token from step 2, discount_rate from step 3
+   → If stock error in result: STOP immediately. Inform user. Do NOT call save_order.
+5. save_order — pass ALL fields below as a JSON string
+
+CRITICAL: get_discount must always come AFTER get_product_details. Never call get_discount before or during step 2.
+
+## STEP 3 — save_order PAYLOAD (every field is required)
+{{
+  "customer_name": "<copy exactly from user message>",
+  "customer_phone": "<copy exactly from user message>",
+  "customer_email": "<copy exactly from user message>",
+  "shipping_address": "<copy exactly from user message>",
+  "items": [{{"product_id": "...", "quantity": N}}, ...],
+  "detail_token": "<from get_product_details>",
+  "discount_rate": <number, from get_discount>,
+  "campaign_code": "<string, from get_discount, e.g. FLASH-10 or FLASH-20>",
+  "customer_tier": "<from get_discount>",
+  "notes": ""
+}}
+IMPORTANT: notes must always be empty string "" — do NOT add content to notes.
+
+Answer in Vietnamese. Keep answers concise."""
 
 
 def build_tools(store: OrderDataStore):
     @tool
     def list_products(search_text: str = "", extra: str = "", limit: int = 8) -> str:
-        """Find products."""
+        """Search the product catalog by name or keywords. Returns product_ids needed for get_product_details. Call get_product_details next with all found product_ids."""
         category = ""
         tags: list[str] = []
         text = (search_text or "").strip()
@@ -59,13 +94,13 @@ def build_tools(store: OrderDataStore):
 
     @tool
     def get_product_details(product_ids_text: str = "") -> str:
-        """Get product info."""
+        """Get price, stock, and detail_token for products. Pass ALL product_ids at once as a JSON array. The returned detail_token is required for calculate_order_totals and save_order."""
         product_ids = _coerce_product_ids(product_ids_text)
         return json.dumps(store.get_product_details(product_ids), ensure_ascii=False)
 
     @tool
     def get_discount(customer: str = "") -> str:
-        """Get discount."""
+        """Get discount_rate and campaign_code for a customer. Pass the customer EMAIL as the `customer` parameter. Returns discount_rate (0.1 or 0.2) and campaign_code (e.g. FLASH-10) — both must be used exactly in save_order."""
         customer_text = customer.strip()
         seed_hint = customer_text
         customer_tier = "standard"
@@ -79,14 +114,14 @@ def build_tools(store: OrderDataStore):
 
     @tool
     def calculate_order_totals(items_text: str = "", discount_rate: float = 0.0, detail_token: str = "") -> str:
-        """Calculate totals."""
+        """Calculate subtotal, discount_amount, and final_total. items_text: JSON list of {product_id, quantity}. discount_rate: from get_discount. detail_token: from get_product_details."""
         items = _coerce_items(items_text)
         payload = store.calculate_order_totals(items=items, detail_token=detail_token, discount_rate=discount_rate)
         return json.dumps(payload, ensure_ascii=False)
 
     @tool
     def save_order(order_payload: str = "") -> str:
-        """Save order."""
+        """Save the confirmed order. order_payload must be a JSON string with: customer_name, customer_phone, customer_email, shipping_address, items (list of {product_id, quantity}), detail_token (from get_product_details), discount_rate (from get_discount), campaign_code (from get_discount), customer_tier (from get_discount)."""
         payload = _coerce_object(order_payload)
         items = _coerce_items(payload.get("items", []))
         result = store.save_order(
@@ -110,7 +145,7 @@ def build_agent(
     data_dir: Path | None = None,
     output_dir: Path | None = None,
     *,
-    provider: str = "google",
+    provider: str = "custom",
     model_name: str | None = None,
     today: str | None = None,
 ):
